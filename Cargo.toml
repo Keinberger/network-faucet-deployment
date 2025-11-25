@@ -1,14 +1,17 @@
 [package]
 name = "network-faucet"
-version = "0.12.2"
+version = "0.12.3"
 edition = "2021"
 
+[[bin]]
+name = "network-faucet"
+path = "src/main.rs"
+
 [dependencies]
-# miden-client = { git ="https://github.com/0xMiden/miden-client", branch = "main", package ="miden-client", features = ["testing", "tonic"] }
-miden-client = { git ="https://github.com/0xMiden/miden-client", branch = "main", package ="miden-client", features = ["testing", "tonic"] }
-miden-objects = { version = "0.12.2" }
-miden-lib = { version = "0.12.2" }
-miden-client-sqlite-store = { git ="https://github.com/0xMiden/miden-client", branch = "main", package ="miden-client-sqlite-store" }
+miden-client = { version = "0.12", package ="miden-client", features = ["testing", "tonic"] }
+miden-objects = { version = "0.12" }
+miden-lib = { version = "0.12" }
+miden-client-sqlite-store = { version = "0.12", package ="miden-client-sqlite-store" }
 
 # Others
 miden-crypto = { version = "0.18", features = ["executable"] }

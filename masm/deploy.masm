@@ -1,0 +1,5 @@
+use.miden::native_account
+
+begin
+    push.0 drop
+end

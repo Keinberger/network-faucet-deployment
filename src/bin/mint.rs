@@ -1,14 +1,11 @@
-use rand::RngCore;
 use std::sync::Arc;
 
 use miden_client::{
-    account::component::{BasicWallet, NetworkFungibleFaucet},
-    account::AccountId,
-    account::{AccountBuilder, AccountStorageMode, AccountType},
-    asset::{Asset, FungibleAsset, TokenSymbol},
+    account::{component::BasicWallet, AccountBuilder, AccountId, AccountStorageMode, AccountType},
+    asset::{Asset, FungibleAsset},
     auth::{AuthRpoFalcon512, AuthSecretKey},
     builder::ClientBuilder,
-    crypto::rpo_falcon512::SecretKey,
+    crypto::{rpo_falcon512::SecretKey, FeltRng},
     keystore::FilesystemKeyStore,
     note::{
         Note, NoteAssets, NoteError, NoteExecutionHint, NoteInputs, NoteMetadata, NoteRecipient,
@@ -20,6 +17,7 @@ use miden_client::{
 };
 use miden_client_sqlite_store::ClientBuilderSqliteExt;
 use miden_lib::note::create_mint_note;
+use rand::RngCore;
 
 fn create_p2id_note_exact(
     sender: AccountId,
@@ -54,9 +52,6 @@ async fn main() -> Result<(), ClientError> {
     let mut client = ClientBuilder::new()
         .rpc(rpc_client)
         .sqlite_store("./store.sqlite3".into())
-        // .store(StoreBuilder::Factory(Box::new(SqliteStoreFactory::new(
-        //     "./store.sqlite3",
-        // ))))
         .authenticator(keystore.clone().into())
         .in_debug_mode(true.into())
         .build()
@@ -73,15 +68,14 @@ async fn main() -> Result<(), ClientError> {
     // Account seed
     let mut init_seed = [0_u8; 32];
     client.rng().fill_bytes(&mut init_seed);
-
-    let key_pair = SecretKey::with_rng(client.rng());
+    let alice_key_pair = SecretKey::with_rng(client.rng());
 
     // Build the account
     let builder = AccountBuilder::new(init_seed)
         .account_type(AccountType::RegularAccountUpdatableCode)
         .storage_mode(AccountStorageMode::Public)
         .with_auth_component(AuthRpoFalcon512::new(
-            key_pair.public_key().to_commitment().into(),
+            alice_key_pair.public_key().to_commitment().into(),
         ))
         .with_component(BasicWallet);
 
@@ -92,7 +86,7 @@ async fn main() -> Result<(), ClientError> {
 
     // Add the key pair to the keystore
     keystore
-        .add_key(&AuthSecretKey::RpoFalcon512(key_pair))
+        .add_key(&AuthSecretKey::RpoFalcon512(alice_key_pair))
         .unwrap();
 
     println!(
@@ -101,74 +95,55 @@ async fn main() -> Result<(), ClientError> {
     );
 
     //------------------------------------------------------------
-    // STEP 3: Create the network faucet account
+    // STEP 2: Define the network faucet account ID
     //------------------------------------------------------------
+    let faucet_account_id = AccountId::from_hex("0xd8e3fa793ea82360734ec91a98e798").unwrap();
+    let faucet_details = client.get_account(faucet_account_id.into()).await.unwrap();
 
-    let mut init_seed = [0_u8; 32];
-    client.rng().fill_bytes(&mut init_seed);
-    let faucet_key_pair = SecretKey::with_rng(client.rng());
-
-    // Build the account
-    let builder = AccountBuilder::new(init_seed)
-        .account_type(AccountType::FungibleFaucet)
-        .storage_mode(AccountStorageMode::Public)
-        .with_auth_component(AuthRpoFalcon512::new(
-            faucet_key_pair.public_key().to_commitment().into(),
-        ))
-        .with_component(
-            NetworkFungibleFaucet::new(
-                TokenSymbol::new("MID").unwrap(),
-                8,
-                Felt::new(1_000_000),
-                alice_account.id(),
-            )
-            .unwrap(),
+    let faucet = if let Some(account_record) = faucet_details {
+        // Clone the account to get an owned instance
+        let account = account_record.account().clone();
+        println!(
+            "Account details: {:?}",
+            account.storage().slots().first().unwrap()
         );
-
-    let faucet_account = builder.build().unwrap();
-
-    // Add the faucet to the client
-    client.add_account(&faucet_account, false).await?;
-
-    // Add the key pair to the keystore
-    keystore
-        .add_key(&AuthSecretKey::RpoFalcon512(faucet_key_pair))
-        .unwrap();
-
-    println!(
-        "Faucet account created and added to client, ID: {:?}",
-        faucet_account.id()
-    );
+        account
+    } else {
+        panic!("Faucet not found!");
+    };
 
     //------------------------------------------------------------
     // STEP 4: Issue MINT note from network faucet to alice
     //------------------------------------------------------------
 
-    let stored_owner_word = faucet_account.storage().get_item(2).unwrap();
+    let stored_owner_word = faucet.storage().get_item(2).unwrap();
     let stored_owner_id = AccountId::new_unchecked([stored_owner_word[3], stored_owner_word[2]]);
 
     // Compute the output P2ID note
     let amount = 50;
-    let mint_asset = FungibleAsset::new(faucet_account.id(), amount)
-        .unwrap()
-        .into();
+    let mint_asset = FungibleAsset::new(faucet.id(), amount).unwrap().into();
     let aux = Felt::new(27);
-    let serial_num = Word::default();
+    let serial_num = client.rng().draw_word();
 
-    let output_note_tag = NoteTag::from_account_id(alice_account.id());
+    let output_note_tag = NoteTag::for_local_use_case(0, 0)?;
     let p2id_mint_output_note = create_p2id_note_exact(
-        faucet_account.id(),
+        faucet_account_id,
         alice_account.id(),
         vec![mint_asset],
-        NoteType::Public,
+        NoteType::Private,
         aux,
         serial_num,
     )?;
 
+    println!(
+        "P2ID OUTPUT NOTE COMMITMENT: {:?}",
+        p2id_mint_output_note.commitment().to_hex()
+    );
+
     let recipient = p2id_mint_output_note.recipient().digest();
 
     let mint_note = create_mint_note(
-        faucet_account.id(),
+        faucet.id(),
         stored_owner_id.into(),
         recipient,
         output_note_tag.into(),
@@ -176,20 +151,27 @@ async fn main() -> Result<(), ClientError> {
         aux,
         aux,
         client.rng(),
-    )
-    .unwrap();
+    )?;
+
+    println!(
+        "MINT NOTE COMMITMENT: {:?}",
+        mint_note.commitment().to_hex()
+    );
 
     let mint_transaction_request = TransactionRequestBuilder::new()
         .own_output_notes(vec![OutputNote::Full(mint_note)])
         .build()
         .unwrap();
 
-    let mint_transaction_result = client
-        .submit_new_transaction(faucet_account.id(), mint_transaction_request)
+    let mint_transaction_id = client
+        .submit_new_transaction(faucet.id(), mint_transaction_request)
         .await
         .unwrap();
 
-    println!("MINT TX successfully submitted");
+    println!(
+        "MINT TX successfully submitted: {:?}",
+        mint_transaction_id.to_hex()
+    );
 
     println!("Waiting for 15 seconds...");
 
@@ -201,12 +183,15 @@ async fn main() -> Result<(), ClientError> {
         .build()
         .unwrap();
 
-    let consume_transaction_result = client
+    let consume_transaction_id = client
         .submit_new_transaction(alice_account.id(), consume_p2id_note_transaction_request)
         .await
         .unwrap();
 
-    println!("CONSUME TX successfully submitted");
+    println!(
+        "CONSUME TX successfully submitted: {:?}",
+        consume_transaction_id.to_hex()
+    );
 
     Ok(())
 }
