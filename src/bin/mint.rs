@@ -1,9 +1,9 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use miden_client::{
     account::{component::BasicWallet, AccountBuilder, AccountId, AccountStorageMode, AccountType},
     asset::{Asset, FungibleAsset},
-    auth::{AuthRpoFalcon512, AuthSecretKey},
+    auth::{AuthRpoFalcon512, AuthSecretKey, TransactionAuthenticator},
     builder::ClientBuilder,
     crypto::{rpo_falcon512::SecretKey, FeltRng},
     keystore::FilesystemKeyStore,
@@ -12,8 +12,9 @@ use miden_client::{
         NoteTag, NoteType, WellKnownNote,
     },
     rpc::{Endpoint, GrpcClient},
-    transaction::{OutputNote, TransactionRequestBuilder},
-    ClientError, Felt, Word,
+    store::TransactionFilter,
+    transaction::{OutputNote, TransactionId, TransactionRequestBuilder, TransactionStatus},
+    Client, ClientError, Felt, Word,
 };
 use miden_client_sqlite_store::ClientBuilderSqliteExt;
 use miden_lib::note::create_mint_note;
@@ -37,6 +38,49 @@ fn create_p2id_note_exact(
     let vault = NoteAssets::new(assets)?;
 
     Ok(Note::new(vault, metadata, recipient))
+}
+
+/// Waits for a transaction to be committed by the network.
+async fn wait_for_transaction<AUTH: TransactionAuthenticator + Sync + 'static>(
+    client: &mut Client<AUTH>,
+    transaction_id: TransactionId,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    loop {
+        client.sync_state().await?;
+
+        let tracked_transaction = client
+            .get_transactions(TransactionFilter::Ids(vec![transaction_id]))
+            .await
+            .map_err(|err| {
+                format!(
+                    "Failed to fetch transaction status while waiting for commitment: {}",
+                    err
+                )
+            })?
+            .pop()
+            .ok_or_else(|| {
+                format!(
+                    "Transaction with ID {} not found while waiting for commitment",
+                    transaction_id
+                )
+            })?;
+
+        match tracked_transaction.status {
+            TransactionStatus::Committed { block_number, .. } => {
+                println!("Transaction committed at block {block_number}.");
+                return Ok(());
+            }
+            TransactionStatus::Pending => {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            TransactionStatus::Discarded(cause) => {
+                return Err(format!(
+                    "Transaction was discarded while waiting for commitment. Cause: {cause:?}"
+                )
+                .into());
+            }
+        }
+    }
 }
 
 #[tokio::main]
@@ -79,7 +123,7 @@ async fn main() -> Result<(), ClientError> {
         ))
         .with_component(BasicWallet);
 
-    let alice_account = builder.build().unwrap();
+    let mut alice_account = builder.build().unwrap();
 
     // Add the account to the client
     client.add_account(&alice_account, false).await?;
@@ -125,7 +169,7 @@ async fn main() -> Result<(), ClientError> {
     let aux = Felt::new(27);
     let serial_num = client.rng().draw_word();
 
-    let output_note_tag = NoteTag::for_local_use_case(0, 0)?;
+    let output_note_tag = NoteTag::from_account_id(alice_account.id());
     let p2id_mint_output_note = create_p2id_note_exact(
         faucet_account_id,
         alice_account.id(),
@@ -164,7 +208,7 @@ async fn main() -> Result<(), ClientError> {
         .unwrap();
 
     let mint_transaction_id = client
-        .submit_new_transaction(faucet.id(), mint_transaction_request)
+        .submit_new_transaction(stored_owner_id, mint_transaction_request)
         .await
         .unwrap();
 
@@ -173,9 +217,12 @@ async fn main() -> Result<(), ClientError> {
         mint_transaction_id.to_hex()
     );
 
-    println!("Waiting for 15 seconds...");
+    println!("Waiting for MINT transaction to be committed...");
 
-    tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+    // tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+    wait_for_transaction(&mut client, mint_transaction_id)
+        .await
+        .unwrap();
 
     // Craft transaction to consume the newly created P2ID note
     let consume_p2id_note_transaction_request = TransactionRequestBuilder::new()
@@ -192,6 +239,28 @@ async fn main() -> Result<(), ClientError> {
         "CONSUME TX successfully submitted: {:?}",
         consume_transaction_id.to_hex()
     );
+
+    println!("Waiting for CONSUME transaction to be committed...");
+
+    wait_for_transaction(&mut client, consume_transaction_id)
+        .await
+        .unwrap();
+
+    client.sync_state().await.unwrap();
+
+    alice_account = client
+        .get_account(alice_account.id())
+        .await
+        .unwrap()
+        .unwrap()
+        .into();
+
+    // print vault assets
+    let asset_balance = alice_account
+        .vault()
+        .get_balance(faucet_account_id)
+        .unwrap();
+    println!("Vault assets: {:?}", asset_balance);
 
     Ok(())
 }
